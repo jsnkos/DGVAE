@@ -1,0 +1,62 @@
+import os
+import random
+import argparse
+from utils import *
+from tqdm import tqdm
+from torch import optim
+# from model import my_model
+import torch.nn.functional as F
+from AAAmodel3 import DGVC
+from dataloader import get_data_loaders
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+seed = 500
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
+
+parser = argparse.ArgumentParser()
+########### pretrain ############
+
+parser.add_argument('--p_epochs', type=int, default=400, help='Number of epochs to train.')
+parser.add_argument('--hid_dim', type=int, default=16, help='Number of units in hidden layer 1.')
+parser.add_argument('--p_lr', type=float, default=1e-3, help='Initial learning rate.')
+parser.add_argument('--dataset', type=str, default='MNIST', help='type of dataset.')
+parser.add_argument('--cluster_num', type=int, default=7, help='type of dataset.')
+parser.add_argument('--device', type=str, default='cuda:0', help='device')
+parser.add_argument('--batch_size', type=int, default=512, help='Number of units in hidden layer 1.')
+########### train ############
+parser.add_argument('--t_epochs', type=int, default=400, help='Number of epochs to train.')
+parser.add_argument('--t_lr', type=float, default=1e-3, help='Initial learning rate.')
+
+args = parser.parse_args()
+
+for args.dataset in ["gtsrb"]:
+    print("Using {} dataset".format(args.dataset))
+
+    if args.dataset == 'gtsrb':
+        args.cluster_num = 10
+        args.mid_dim = 512
+        args.hid_dim = 10
+        args.feature_dim = 128
+        args.p_epochs = 400
+        args.p_lr = 6e-4  # 3e-4
+        args.t_epochs = 300
+        args.t_lr = 6e-3
+        args.batch_size = 256  # 512
+    fl, DL, TL = get_data_loaders(dataset_name=args.dataset, batch_size=args.batch_size, num_workers=4)
+    print(fl, DL, TL)
+
+    model = DGVC(args).to(args.device)
+    save_path = "./results/"
+
+    pretrain_path = os.path.join(save_path, args.dataset, 'pretrain', 'model_pretrain.pk')  
+    y_pred, y = model.pretrain(fl,#训练
+                            epochs=args.p_epochs, lr=args.p_lr,
+                            save_path=save_path, dataset=args.dataset)
+    torch.save(model.state_dict(), pretrain_path)
+    print(f"[Info] Model saved to {pretrain_path}")
+
+
+
