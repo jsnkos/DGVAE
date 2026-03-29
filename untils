@@ -1,0 +1,132 @@
+import torch
+import random
+import numpy as np
+import pickle as pkl
+import networkx as nx
+import scipy.sparse as sp
+from sklearn import metrics
+from munkres import Munkres
+from kmeans_gpu import kmeans
+from sklearn.metrics import adjusted_rand_score as ari_score
+from sklearn.metrics.cluster import normalized_mutual_info_score as nmi_score
+from scipy.special import iv
+import math
+from ive1 import ive
+
+
+def cluster_acc(y_true, y_pred):
+
+    y_true = np.asarray(y_true).astype(int)
+    y_pred = np.asarray(y_pred).astype(int)
+
+    true_labels, y_true_idx = np.unique(y_true, return_inverse=True)   # [N]
+    pred_labels, y_pred_idx = np.unique(y_pred, return_inverse=True)   # [N]
+    n_true, n_pred = true_labels.size, pred_labels.size
+
+    cm = np.zeros((n_pred, n_true), dtype=np.int64)
+    for i in range(n_pred):
+        mask = (y_pred_idx == i)
+        if mask.any():
+            counts = np.bincount(y_true_idx[mask], minlength=n_true)
+            cm[i] = counts
+
+    try:
+        from scipy.optimize import linear_sum_assignment
+        row_ind, col_ind = linear_sum_assignment(cm.max() - cm)
+    except Exception:
+        from munkres import Munkres
+        pairs = Munkres().compute((cm.max() - cm).tolist())
+        row_ind = np.array([r for r, _ in pairs])
+        col_ind = np.array([c for _, c in pairs])
+
+    mapping = {r: true_labels[c] for r, c in zip(row_ind, col_ind)}
+    majority_true = true_labels[np.argmax(np.bincount(y_true_idx))]
+    y_pred_mapped = np.array([mapping.get(i, majority_true) for i in y_pred_idx],
+                             dtype=true_labels.dtype)
+
+    acc = metrics.accuracy_score(y_true, y_pred_mapped)
+    f1_macro = metrics.f1_score(y_true, y_pred_mapped, labels=true_labels,
+                                average='macro', zero_division=0)
+    return acc, f1_macro
+
+
+def eva(y_true, y_pred, show_details=True):
+    """
+    evaluate the clustering performance
+    Args:
+        y_true: the ground truth
+        y_pred: the predicted label
+        show_details: if print the details
+    Returns: None
+    """
+    acc, f1 = cluster_acc(y_true, y_pred)
+    nmi = nmi_score(y_true, y_pred, average_method='arithmetic')
+    ari = ari_score(y_true, y_pred)
+    if show_details:
+        print(':acc {:.4f}'.format(acc), ', nmi {:.4f}'.format(nmi), ', ari {:.4f}'.format(ari),
+              ', f1 {:.4f}'.format(f1))
+    return acc, nmi, ari, f1
+
+def KLD_loss1(mu_c1, lam1, pred_weight, pred, lam1_0, lam1_1, mu_g1, logvar1,mu_g2, logvar2):
+    # print('mu', mu)
+    # print('mu_z1', mu_z1)
+    # print('lam_z1', lam_z1)
+    e_k_mu_z = (d_besseli(10 / 2 - 1, lam1) * mu_c1).mm((lam1_1 * pred_weight).transpose(1, 0))
+    e_k_mu_z_new = torch.sum((d_besseli(10 / 2 - 1, lam1) * mu_c1) * (lam1 * mu_c1), 1, keepdim=True)
+     
+    Loss1 = torch.mean((10 * ((10 / 2 - 1) * torch.log(lam1) - 10 / 2 * math.log(math.pi)
+                             - torch.log(ive(10 / 2 - 1, lam1)) + e_k_mu_z_new)))
+
+    Loss2 = torch.mean(torch.sum(pred * (
+            10 * ((10 / 2 - 1) * torch.log(lam1_0) - 10 / 2 * math.log(math.pi)
+                  - torch.log(ive(10 / 2 - 1, lam1_0)) + e_k_mu_z)), 1))
+    #torch.log(ive(10/2-1,lam1_0))
+    Loss= Loss1 - Loss2
+    p_z1=  -0.5 * torch.sum(1 + logvar1 - mu_g1.pow(2) - logvar1.exp()) 
+    p_z2=  -0.5 * torch.sum(1 + logvar2 - mu_g2.pow(2) - logvar2.exp()) 
+    p_z = p_z1 +p_z2
+    return Loss, p_z
+
+def CH_loss( mu_c, lam, mu_c1, lam1, mu_c2, lam2 ):
+
+    e_k_mu_z = torch.sum((d_besseli(10 / 2 - 1, lam) * mu_c) * (lam * mu_c), 1, keepdim=True)
+    e_k_mu_z_new = torch.sum((d_besseli(10 / 2 - 1, lam1) * mu_c) * (lam1 * mu_c1), 1, keepdim=True)
+    e_k_mu_z_new_new = torch.sum((d_besseli(10 / 2 - 1, lam2) * mu_c) * (lam2 * mu_c2), 1, keepdim=True)
+
+
+    z_ze1 = torch.sum(10 * ((10 / 2 - 1) * torch.log(lam) - (10 / 2 - 1) * torch.log(
+        lam1) + e_k_mu_z - e_k_mu_z_new - torch.log(ive(10 / 2 - 1, lam)) + torch.log(
+        ive(10 / 2 - 1, lam1))))
+    
+    z_ze2 = torch.sum(10 * ((10 / 2 - 1) * torch.log(lam) - (10 / 2 - 1) * torch.log(
+        lam2) + e_k_mu_z - e_k_mu_z_new_new - torch.log(ive(10 / 2 - 1, lam)) + torch.log(
+        ive(10 / 2 - 1, lam2))))
+    
+    z_ze = 0.5*(
+        z_ze1 
+        + z_ze2
+    )
+    return z_ze
+
+def Ga_loss(mu1, logvar1, mu2, logvar2, reduction='mean'):
+    # N1 = N(mu1, diag(exp(logvar1))), N2 = N(mu2, diag(exp(logvar2)))
+    var1 = logvar1.exp()
+    var2 = logvar2.exp()
+    kl_per_dim = 0.5 * ( (logvar2 - logvar1) + (var1 + (mu1 - mu2).pow(2)) / var2 - 1 )
+    kl = kl_per_dim.sum(dim=1)  # [B]
+    if reduction == 'mean':
+        return kl.mean()
+    elif reduction == 'sum':
+        return kl.sum()
+    elif reduction == 'none':
+        return kl
+
+
+
+def d_besseli(nu, kk):
+    try:
+        bes = iv(nu + 1, kk) / (iv(nu, kk) + 1e-10)
+        assert (min(torch.isfinite(bes)))
+    except:
+        bes = torch.sqrt(1 + (nu ** 2) / (kk ** 2))
+    return bes
