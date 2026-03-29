@@ -1,0 +1,151 @@
+import numpy as np
+from sklearn.metrics.pairwise import euclidean_distances
+from scipy.spatial.distance import cdist
+import matplotlib.pyplot as plt
+from scipy.ndimage import convolve
+
+class FuzzyCMeans:
+    def __init__(self, n_clusters=3, m=2, beta=0.5, image_shape=None,
+                 max_iter=100, tol=1e-4, random_state=None):
+        """
+        参数:
+        beta (float): 邻域权重系数
+        image_shape (tuple): 输入图像的形状 (height, width)，用于空间操作
+        """
+        self.n_clusters = n_clusters
+        self.m = m
+        self.beta = beta
+        self.image_shape = image_shape  # 例如 (height, width)
+        self.max_iter = max_iter
+        self.tol = tol
+        self.random_state = random_state
+        self.cluster_centers_ = None
+        self.u = None  # 隶属度矩阵
+        self.fpc_ = None  # 模糊分割系数
+
+    def _apply_spatial_smoothing(self, u):
+        """
+        对隶属度矩阵应用空间平滑，结合邻域像素信息。
+        """
+        if self.image_shape is None:
+            return u  # 如果没有空间信息，直接返回
+
+        height, width = self.image_shape
+        K = self.n_clusters
+        u_img = u.reshape(height, width, K)  # 转换为图像格式 (H, W, K)
+        u_smoothed_img = np.zeros_like(u_img)
+
+        # 定义 3x3 邻域卷积核（排除中心像素）
+        kernel = np.array([[1, 1, 1],
+                           [1, 0, 1],
+                           [1, 1, 1]])
+
+        # 对每个类别通道进行卷积
+        for k in range(K):
+            neighbor_sum = convolve(u_img[:, :, k], kernel, mode='constant', cval=0.0)
+            u_smoothed_img[:, :, k] = u_img[:, :, k] + self.beta * neighbor_sum
+
+        # 归一化：确保每行和为 1
+        u_smoothed_img /= u_smoothed_img.sum(axis=2, keepdims=True)
+
+        return u_smoothed_img.reshape(-1, K)  # 恢复为 (n_samples, K)
+
+    def _init_membership(self, n_samples):
+        """初始化隶属度矩阵（随机归一化）"""
+        np.random.seed(self.random_state)
+        u = np.random.rand(n_samples, self.n_clusters)
+        return u / u.sum(axis=1, keepdims=True)
+
+    def _compute_centers(self, X, u):
+        """计算聚类中心"""
+        um = u ** self.m
+        return np.dot(um.T, X) / um.sum(axis=0, keepdims=True).T
+
+    def _compute_distances(self, X, centers):
+        """计算样本到中心的欧氏距离"""
+        return cdist(X, centers, metric='euclidean')
+
+    def _update_membership(self, X, centers):
+        """更新隶属度矩阵"""
+        distances = self._compute_distances(X, centers)
+        distances = np.fmax(distances, np.finfo(X.dtype).eps)  # 防止除零
+
+        power = 2.0 / (self.m - 1)
+        inv_distances = 1.0 / distances ** power
+        return inv_distances / inv_distances.sum(axis=1, keepdims=True)
+
+    def fit(self, X):
+        """
+        执行模糊聚类，结合空间信息。
+        """
+        n_samples = X.shape[0]
+        self.u = self._init_membership(n_samples)
+
+        for iter in range(self.max_iter):
+            old_u = self.u.copy()
+            centers = self._compute_centers(X, self.u)
+            self.u = self._update_membership(X, centers)  # 原始隶属度更新
+
+            # 应用空间平滑
+            self.u = self._apply_spatial_smoothing(self.u)
+
+            # 检查收敛
+            if np.linalg.norm(self.u - old_u) < self.tol:
+                print(f"收敛于迭代次数 {iter}")
+                break
+
+        self.cluster_centers_ = centers
+        self._compute_fpc()
+        return self
+
+    def _compute_fpc(self):
+        self.fpc_ = np.sum(self.u ** 2) / self.u.shape[0]
+
+    def predict(self, X):
+        """
+        预测样本的隶属度
+
+        返回:
+        np.ndarray: 隶属度矩阵 [n_samples, n_clusters]
+        """
+        return self._update_membership(X, self.cluster_centers_)
+
+    def predict_labels(self, X):
+        """
+        预测样本的最可能标签
+
+        返回:
+        np.ndarray: 簇标签 [n_samples,]
+        """
+        return np.argmax(self.predict(X), axis=1)
+
+    def plot_clusters(self, X, labels=None):
+        """
+        可视化二维数据聚类结果
+
+        参数:
+        X (np.ndarray): 二维输入数据 [n_samples, 2]
+        labels (np.ndarray): 真实标签（可选）
+        """
+        if X.shape[1] != 2:
+            raise ValueError("仅支持二维数据可视化")
+
+        plt.figure(figsize=(10, 6))
+        colors = ['r', 'g', 'b', 'c', 'm', 'y', 'k']
+
+        # 绘制预测结果
+        u = self.predict(X)
+        for i in range(self.n_clusters):
+            plt.scatter(X[:, 0], X[:, 1], c=u[:, i], cmap='viridis', alpha=0.5)
+
+        # 绘制聚类中心
+        plt.scatter(self.cluster_centers_[:, 0], self.cluster_centers_[:, 1],
+                    marker='X', s=200, c='red', edgecolor='k', label='聚类中心')
+
+        plt.title(f'模糊C均值聚类结果 (FPC: {self.fpc_:.3f})')
+        plt.xlabel('特征维度1')
+        plt.ylabel('特征维度2')
+        plt.legend()
+        plt.show()
+
+
